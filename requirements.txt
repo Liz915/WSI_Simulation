@@ -3,4 +3,5 @@ scipy
 matplotlib
 plotly
 scikit-image
+tqdm
 jupyter
