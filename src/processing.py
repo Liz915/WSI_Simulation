@@ -86,98 +86,59 @@ def process_cps_subpixel(stack, z_scan, smooth_sigma=8.0):
 
 def process_fft_phase(stack, z_scan, smooth_sigma=10.0, band_frac=0.15):
     """
-    算法二：基于FFT频域滤波和亚像素相位的WLPSI重建
+    算法二：基于FFT频域载波相位的WLPSI重建 (Takeda 修正版)
     （适用于高精度离线计量）
     
     参数:
         stack: 3D干涉信号栈 (n_z, n_y, n_x)
         z_scan: Z轴扫描位置数组 (n_z,)
-        smooth_sigma: 包络平滑强度，建议10.0-15.0
-        band_frac: 频域滤波带宽比例
+        smooth_sigma: (此方法中未使用，为保持接口一致性保留)
+        band_frac: (此方法中未使用，为保持接口一致性保留)
         
     返回:
         wrapped_phase_map: 包裹相位图 (n_y, n_x) [-π, π]
         coherence_map: 相干度图 (n_y, n_x)
     """
+    print(f"🔧 开始FFT相位算法处理 (Takeda 修正版): 栈尺寸{stack.shape}")
     n_z, n_y, n_x = stack.shape
     
     if n_z < 3:
         raise ValueError("需要至少3个Z轴采样点")
-    
-    print(f"🔧 开始FFT相位算法处理: 栈尺寸{stack.shape}, 平滑sigma={smooth_sigma}")
-    
-    # 1. 计算Z轴步长
-    dz = float(z_scan[1] - z_scan[0])  # 修正：计算实际步长
+
+    # 1. 计算Z轴步长 (dz)
+    dz = float(z_scan[1] - z_scan[0])
     
     # 2. 沿Z轴进行FFT
     stack_fft = fft(stack, axis=0)
     freqs = fftfreq(n_z, d=dz)
     
-    # 3. 自适应带通滤波器设计
-    mean_spectrum = np.mean(np.abs(stack_fft), axis=(1, 2))
-    center_idx = np.argmax(mean_spectrum)
+    # 3. 找到正频率的载波频率 (关键步骤)
+    # 我们只关心正频率部分 (k > 0)，因为负频率是共轭的
+    positive_freq_mask = (freqs > 0)
     
-    half_bw = max(2, int(n_z * band_frac / 2))
-    sigma = max(1.0, half_bw / 2.0)
+    # 如果没有正频率 (例如采样点太少)，则出错
+    if not np.any(positive_freq_mask):
+        raise ValueError("无法找到正载波频率，请检查Z轴采样")
+        
+    # 计算正频率部分的平均频谱
+    mean_spectrum = np.mean(np.abs(stack_fft[positive_freq_mask, :, :]), axis=(1, 2))
     
-    idxs = np.arange(n_z)
-    band = np.exp(-0.5 * ((idxs - center_idx) / sigma)**2)
+    # 找到正频率中的峰值索引（相对于掩码）
+    center_idx_relative = np.argmax(mean_spectrum)
     
-    # 构造解析信号滤波器（抑制负频率）
-    analytic_mask = np.zeros_like(freqs, dtype=float)
-    analytic_mask[freqs > 0] = 2.0
-    analytic_mask[np.isclose(freqs, 0.0)] = 1.0
+    # 将其映射回原始FFT数组的绝对索引
+    positive_indices = np.where(positive_freq_mask)[0]
+    center_idx_absolute = positive_indices[center_idx_relative]
     
-    filter_1d = band * analytic_mask
-    filter_3d = filter_1d.reshape(n_z, 1, 1)
+    print(f"  ...检测到载波频率索引: {center_idx_absolute} (对应频率: {freqs[center_idx_absolute]:.2f})")
     
-    # 4. 应用滤波器并逆变换
-    stack_fft_filtered = stack_fft * filter_3d  # 修正：定义stack_fft_filtered
-    analytic_stack = ifft(stack_fft_filtered, axis=0)
+    # 4. 提取该频率下的相位和相干度 (核心)
     
-    # 5. 提取包络和相位
-    envelope = np.abs(analytic_stack)
-    phase_stack = np.angle(analytic_stack)
+    # 包裹相位图 = 该载波频率分量的相位角
+    wrapped_phase_map = np.angle(stack_fft[center_idx_absolute, :, :])
     
-    # 6. 强力平滑包络 - 关键改进！
-    envelope_smooth = gaussian_filter1d(envelope, sigma=smooth_sigma, axis=0, mode='nearest')
-    
-    # 7. 寻找包络峰值
-    peak_idx = np.argmax(envelope_smooth, axis=0)
-    
-    # 8. 亚像素相位插值
-    wrapped_phase_map = np.zeros((n_y, n_x), dtype=float)  # 修正：定义返回变量
-    coherence_map = np.zeros((n_y, n_x), dtype=float)      # 修正：定义返回变量
-    
-    z_indices = np.arange(n_z)  # 修正：定义z_indices
-    
-    for yi in range(n_y):
-        for xi in range(n_x):
-            i = int(peak_idx[yi, xi])
-            
-            # 边界保护
-            if i <= 0:
-                i = 1
-            if i >= n_z - 1:
-                i = n_z - 2
-            
-            # 亚像素拟合
-            vm1 = envelope_smooth[i - 1, yi, xi]
-            v0 = envelope_smooth[i, yi, xi]
-            vp1 = envelope_smooth[i + 1, yi, xi]
-            shift = _parabolic_subpixel(vm1, v0, vp1)
-            float_idx = i + shift
-            
-            # 复数插值获取精确相位
-            real_seq = analytic_stack[:, yi, xi].real
-            imag_seq = analytic_stack[:, yi, xi].imag
-            
-            real_val = np.interp(float_idx, z_indices, real_seq)
-            imag_val = np.interp(float_idx, z_indices, imag_seq)
-            complex_val = real_val + 1j * imag_val
-            
-            wrapped_phase_map[yi, xi] = np.angle(complex_val)
-            coherence_map[yi, xi] = np.interp(float_idx, z_indices, envelope[:, yi, xi])
-    
-    print("✅ FFT相位算法处理完成")
-    return wrapped_phase_map, coherence_map  # 修正：返回已定义的变量
+    # 相干度图 = 该载波频率分量的幅度
+    coherence_map = np.abs(stack_fft[center_idx_absolute, :, :])
+
+    print("✅ FFT相位算法 (Takeda 修正版) 处理完成")
+    return wrapped_phase_map, coherence_map
